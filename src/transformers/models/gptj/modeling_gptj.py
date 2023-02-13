@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """ PyTorch GPT-J model."""
+import itertools
 
 import warnings
 from typing import Optional, Tuple, Union
@@ -146,8 +147,7 @@ class GPTJAttention(nn.Module):
         return tensor.view(new_shape)
     
     # created by dhlee347 for gpt-jt
-    import itertools
-    def attention_masking(self, attention_mask):
+    def prefix_lm_masking(self, attention_mask):
         batch_size, seq_len = attention_mask.shape[0], attention_mask.shape[-1]
         mask_2d = torch.zeros(batch_size, 1, seq_len, seq_len, dtype=torch.bool).to(attention_mask.device)
 
@@ -183,13 +183,17 @@ class GPTJAttention(nn.Module):
         # modified by dhlee347 for gpt-jt
         # no use of query_length, key_length - assume it's the same (valid only for gpt)
         #causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length].to(torch.bool)
-        causal_mask = self.attention_masking(attention_mask)
+        causal_mask = self.prefix_lm_masking(attention_mask)
+        causal_mask = causal_mask[:, :, key_length - query_length : key_length, :key_length]
 
         # Keep the attention weights computation in fp32 to avoid overflow issues
         query = query.to(torch.float32)
         key = key.to(torch.float32)
 
         attn_weights = torch.matmul(query, key.transpose(-1, -2))
+
+        #print("1>", attention_mask.view(-1))
+        #print("2>", causal_mask.squeeze(0).squeeze(1).to(torch.long))
 
         mask_value = torch.finfo(attn_weights.dtype).min
         # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
