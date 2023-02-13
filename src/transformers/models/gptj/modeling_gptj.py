@@ -144,6 +144,30 @@ class GPTJAttention(nn.Module):
             raise ValueError(f"Input tensor rank should be one of [4, 5], but is: {len(tensor.shape)}")
         new_shape = tensor.size()[:-2] + (num_attention_heads * attn_head_size,)
         return tensor.view(new_shape)
+    
+    # created by dhlee347 for gpt-jt
+    import itertools
+    def attention_masking(self, attention_mask):
+        batch_size, seq_len = attention_mask.shape[0], attention_mask.shape[-1]
+        mask_2d = torch.zeros(batch_size, 1, seq_len, seq_len, dtype=torch.bool).to(attention_mask.device)
+
+        for b, mask_1d in enumerate(attention_mask):
+            input_start, input_end = 0, 0
+            for group in itertools.groupby(enumerate(mask_1d.view(-1)), key=lambda x: x[1]):
+                mask_type = group[0]
+                indexes = [e[0] for e in group[1]]
+                start, end = indexes[0], indexes[-1] + 1
+                if mask_type == 2:
+                    mask_2d[b, 0, start:end, start:end] = True
+                    input_start, input_end = start, end
+                if mask_type == 1:
+                    mask_2d[b, 0, start:end, input_start:input_end] = True
+                    mask_2d[b, 0, start:end, start:end] = torch.tril(torch.ones(end-start, end-start, dtype=torch.bool))
+                    input_start, input_end = 0, 0
+                if mask_type == 0:
+                    input_start, input_end = 0, 0
+        
+        return mask_2d
 
     def _attn(
         self,
@@ -155,7 +179,11 @@ class GPTJAttention(nn.Module):
     ):
         # compute causal mask from causal mask buffer
         query_length, key_length = query.size(-2), key.size(-2)
-        causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length].to(torch.bool)
+
+        # modified by dhlee347 for gpt-jt
+        # no use of query_length, key_length - assume it's the same (valid only for gpt)
+        #causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length].to(torch.bool)
+        causal_mask = self.attention_masking(attention_mask)
 
         # Keep the attention weights computation in fp32 to avoid overflow issues
         query = query.to(torch.float32)
@@ -171,9 +199,10 @@ class GPTJAttention(nn.Module):
 
         attn_weights = attn_weights / self.scale_attn
 
-        if attention_mask is not None:
-            # Apply the attention mask
-            attn_weights = attn_weights + attention_mask
+        # modified by dhlee347 for gpt-jt
+        # if attention_mask is not None:
+        #     # Apply the attention mask
+        #     attn_weights = attn_weights + attention_mask
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
         attn_weights = attn_weights.to(value.dtype)
@@ -611,8 +640,9 @@ class GPTJModel(GPTJPreTrainedModel):
             # positions we want to attend and the dtype's smallest value for masked positions.
             # Since we are adding it to the raw scores before the softmax, this is
             # effectively the same as removing these entirely.
-            attention_mask = attention_mask.to(dtype=self.dtype)  # fp16 compatibility
-            attention_mask = (1.0 - attention_mask) * torch.finfo(self.dtype).min
+            # commented by dhlee347 for gpt-jt
+            # attention_mask = attention_mask.to(dtype=self.dtype)  # fp16 compatibility
+            # attention_mask = (1.0 - attention_mask) * torch.finfo(self.dtype).min
 
         # Prepare head mask if needed
         # 1.0 in head_mask indicate we keep the head
@@ -784,7 +814,9 @@ class GPTJForCausalLM(GPTJPreTrainedModel):
 
         if attention_mask is not None and position_ids is None:
             # create position_ids on the fly for batch generation
-            position_ids = attention_mask.long().cumsum(-1) - 1
+            # modified by dhlee347 for gpt-jt
+            # position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids = torch.gt(attention_mask, 0).long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
             if past_key_values:
                 position_ids = position_ids[:, -1].unsqueeze(-1)
