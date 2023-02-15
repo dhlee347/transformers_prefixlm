@@ -150,6 +150,7 @@ class GPTJAttention(nn.Module):
     def prefix_lm_masking(self, attention_mask):
         batch_size, seq_len = attention_mask.shape[0], attention_mask.shape[-1]
         mask_2d = torch.zeros(batch_size, 1, seq_len, seq_len, dtype=torch.bool).to(attention_mask.device)
+        tril_tensor = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool))
 
         for b, mask_1d in enumerate(attention_mask):
             input_start, input_end = 0, 0
@@ -162,7 +163,7 @@ class GPTJAttention(nn.Module):
                     input_start, input_end = start, end
                 if mask_type == 1:
                     mask_2d[b, 0, start:end, input_start:input_end] = True
-                    mask_2d[b, 0, start:end, start:end] = torch.tril(torch.ones(end-start, end-start, dtype=torch.bool))
+                    mask_2d[b, 0, start:end, start:end] = tril_tensor[:end-start, :end-start]
                     input_start, input_end = 0, 0
                 if mask_type == 0:
                     input_start, input_end = 0, 0
