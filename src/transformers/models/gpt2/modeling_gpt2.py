@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """PyTorch OpenAI GPT-2 model."""
+import itertools
 
 import math
 import os
@@ -120,6 +121,41 @@ def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
     return model
 
 
+# created by dhlee347 for prefix LM
+def prefix_lm_masking(attention_mask):
+    batch_size, seq_len = attention_mask.shape[0], attention_mask.shape[-1]
+    device = attention_mask.device
+
+    mask_2d = torch.zeros(batch_size, seq_len, seq_len, dtype=torch.bool, device=device)
+    causal_mask = torch.tril(torch.ones(1, seq_len, seq_len, dtype=torch.bool, device=device))
+    position_ids = torch.zeros(batch_size, seq_len, dtype=torch.long, device=device)
+
+    for b, mask_1d in enumerate(attention_mask):
+        input_start, input_end = 0, 0
+        next_position_id = 0
+        for group in itertools.groupby(enumerate(mask_1d.view(-1)), key=lambda x: x[1]):
+            mask_type = group[0]
+            indexes = [e[0] for e in group[1]]
+            start, end = indexes[0], indexes[-1] + 1
+            if mask_type == 2:
+                mask_2d[b, start:end, start:end] = True
+                position_ids[b, start:end] = torch.arange(0, end-start, dtype=torch.long, device=device)
+                input_start, input_end = start, end
+                next_position_id = end-start
+            if mask_type == 1:
+                mask_2d[b, start:end, input_start:input_end] = True
+                mask_2d[b, start:end, start:end] = causal_mask[0, :end-start, :end-start]
+                position_ids[b, start:end] = torch.arange(next_position_id, next_position_id+end-start, dtype=torch.long, device=device)
+                input_start, input_end = 0, 0
+                next_position_id = 0
+                
+            if mask_type == 0:
+                position_ids[b, start:end] = 0
+                input_start, input_end = 0, 0
+                next_position_id = 0
+    
+    return mask_2d, position_ids
+
 class GPT2Attention(nn.Module):
     def __init__(self, config, is_cross_attention=False, layer_idx=None):
         super().__init__()
@@ -178,7 +214,7 @@ class GPT2Attention(nn.Module):
         self.num_heads = self.num_heads - len(heads)
         self.pruned_heads = self.pruned_heads.union(heads)
 
-    def _attn(self, query, key, value, attention_mask=None, head_mask=None):
+    def _attn(self, query, key, value, attention_mask=None, causal_mask=None, head_mask=None):
         attn_weights = torch.matmul(query, key.transpose(-1, -2))
 
         if self.scale_attn_weights:
@@ -193,16 +229,21 @@ class GPT2Attention(nn.Module):
         if not self.is_cross_attention:
             # if only "normal" attention layer implements causal mask
             query_length, key_length = query.size(-2), key.size(-2)
-            causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length].to(torch.bool)
+            # modified by dhlee347 for prefix LM
+            causal_mask = causal_mask[:, None, key_length - query_length : key_length, :key_length].to(torch.bool)
+            # print(causal_mask.shape)
+            # print(causal_mask.to(torch.int8))
+
             mask_value = torch.finfo(attn_weights.dtype).min
             # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
             # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
             mask_value = torch.full([], mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
             attn_weights = torch.where(causal_mask, attn_weights.to(attn_weights.dtype), mask_value)
 
-        if attention_mask is not None:
-            # Apply the attention mask
-            attn_weights = attn_weights + attention_mask
+        # modified by dhlee347 for prefix LM
+        # if attention_mask is not None:
+        #     # Apply the attention mask
+        #     attn_weights = attn_weights + attention_mask
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
@@ -291,6 +332,7 @@ class GPT2Attention(nn.Module):
         hidden_states: Optional[Tuple[torch.FloatTensor]],
         layer_past: Optional[Tuple[torch.Tensor]] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
+        causal_mask: Optional[torch.BoolTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
@@ -327,7 +369,7 @@ class GPT2Attention(nn.Module):
         if self.reorder_and_upcast_attn:
             attn_output, attn_weights = self._upcast_and_reordered_attn(query, key, value, attention_mask, head_mask)
         else:
-            attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
+            attn_output, attn_weights = self._attn(query, key, value, attention_mask, causal_mask, head_mask)
 
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
         attn_output = self.c_proj(attn_output)
@@ -378,6 +420,7 @@ class GPT2Block(nn.Module):
         hidden_states: Optional[Tuple[torch.FloatTensor]],
         layer_past: Optional[Tuple[torch.Tensor]] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
+        causal_mask: Optional[torch.BoolTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
@@ -390,6 +433,7 @@ class GPT2Block(nn.Module):
             hidden_states,
             layer_past=layer_past,
             attention_mask=attention_mask,
+            causal_mask=causal_mask,
             head_mask=head_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
@@ -787,6 +831,10 @@ class GPT2Model(GPT2PreTrainedModel):
 
         device = input_ids.device if input_ids is not None else inputs_embeds.device
 
+        causal_mask, position_ids = prefix_lm_masking(attention_mask)
+        if past_key_values:
+            position_ids = position_ids[:, -1].unsqueeze(-1)
+
         if token_type_ids is not None:
             token_type_ids = token_type_ids.view(-1, input_shape[-1])
         if position_ids is not None:
@@ -800,26 +848,26 @@ class GPT2Model(GPT2PreTrainedModel):
         if position_ids is None:
             position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
-
+    
         # GPT2Attention mask.
-        if attention_mask is not None:
-            if batch_size <= 0:
-                raise ValueError("batch_size has to be defined and > 0")
-            attention_mask = attention_mask.view(batch_size, -1)
+        # if attention_mask is not None:
+            # if batch_size <= 0:
+            #     raise ValueError("batch_size has to be defined and > 0")
+            # attention_mask = attention_mask.view(batch_size, -1)
             # We create a 3D attention mask from a 2D tensor mask.
             # Sizes are [batch_size, 1, 1, to_seq_length]
             # So we can broadcast to [batch_size, num_heads, from_seq_length, to_seq_length]
             # this attention mask is more simple than the triangular masking of causal attention
             # used in OpenAI GPT, we just need to prepare the broadcast dimension here.
-            attention_mask = attention_mask[:, None, None, :]
+            # attention_mask = attention_mask[:, None, None, :]
 
-            # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
-            # masked positions, this operation will create a tensor which is 0.0 for
-            # positions we want to attend and the dtype's smallest value for masked positions.
-            # Since we are adding it to the raw scores before the softmax, this is
-            # effectively the same as removing these entirely.
-            attention_mask = attention_mask.to(dtype=self.dtype)  # fp16 compatibility
-            attention_mask = (1.0 - attention_mask) * torch.finfo(self.dtype).min
+        #     # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
+        #     # masked positions, this operation will create a tensor which is 0.0 for
+        #     # positions we want to attend and the dtype's smallest value for masked positions.
+        #     # Since we are adding it to the raw scores before the softmax, this is
+        #     # effectively the same as removing these entirely.
+        #     # attention_mask = attention_mask.to(dtype=self.dtype)  # fp16 compatibility
+        #     # attention_mask = (1.0 - attention_mask) * torch.finfo(self.dtype).min
 
         # If a 2D or 3D attention mask is provided for the cross-attention
         # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
@@ -850,6 +898,7 @@ class GPT2Model(GPT2PreTrainedModel):
         hidden_states = self.drop(hidden_states)
 
         output_shape = input_shape + (hidden_states.size(-1),)
+
 
         presents = () if use_cache else None
         all_self_attentions = () if output_attentions else None
@@ -898,6 +947,7 @@ class GPT2Model(GPT2PreTrainedModel):
                     hidden_states,
                     layer_past=layer_past,
                     attention_mask=attention_mask,
+                    causal_mask=causal_mask,
                     head_mask=head_mask[i],
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
@@ -1015,7 +1065,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
 
         if attention_mask is not None and position_ids is None:
             # create position_ids on the fly for batch generation
-            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids = torch.gt(attention_mask, 0).long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
             if past_key_values:
                 position_ids = position_ids[:, -1].unsqueeze(-1)
@@ -1069,7 +1119,6 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
         transformer_outputs = self.transformer(
             input_ids,
             past_key_values=past_key_values,
@@ -1209,7 +1258,7 @@ class GPT2DoubleHeadsModel(GPT2PreTrainedModel):
 
         if attention_mask is not None and position_ids is None:
             # create position_ids on the fly for batch generation
-            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids = torch.gt(attention_mask, 0).long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
             if past_key_values:
                 position_ids = position_ids[:, -1].unsqueeze(-1)
