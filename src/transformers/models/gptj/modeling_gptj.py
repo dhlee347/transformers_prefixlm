@@ -162,7 +162,7 @@ class GPTJAttention(nn.Module):
                     input_start, input_end = start, end
                 if mask_type == 1:
                     mask_2d[b, 0, start:end, input_start:input_end] = True
-                    mask_2d[b, 0, start:end, start:end] = torch.tril(torch.ones(end-start, end-start, dtype=torch.bool))
+                    mask_2d[b, 0, start:end, start:end] = self.bias[0, 0, :end-start, :end-start]
                     input_start, input_end = 0, 0
                 if mask_type == 0:
                     input_start, input_end = 0, 0
