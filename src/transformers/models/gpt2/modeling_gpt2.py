@@ -954,6 +954,7 @@ class GPT2Model(GPT2PreTrainedModel):
                     hidden_states,
                     None,
                     attention_mask,
+                    self.causal_mask,
                     head_mask[i],
                     encoder_hidden_states,
                     encoder_attention_mask,
