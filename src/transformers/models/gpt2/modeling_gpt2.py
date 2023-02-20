@@ -121,41 +121,6 @@ def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
     return model
 
 
-# created by dhlee347 for prefix LM
-def prefix_lm_masking(attention_mask):
-    batch_size, seq_len = attention_mask.shape[0], attention_mask.shape[-1]
-    device = attention_mask.device
-
-    mask_2d = torch.zeros(batch_size, seq_len, seq_len, dtype=torch.bool, device=device)
-    causal_mask = torch.tril(torch.ones(1, seq_len, seq_len, dtype=torch.bool, device=device))
-    position_ids = torch.zeros(batch_size, seq_len, dtype=torch.long, device=device)
-
-    for b, mask_1d in enumerate(attention_mask):
-        input_start, input_end = 0, 0
-        next_position_id = 0
-        for group in itertools.groupby(enumerate(mask_1d.view(-1)), key=lambda x: x[1]):
-            mask_type = group[0]
-            indexes = [e[0] for e in group[1]]
-            start, end = indexes[0], indexes[-1] + 1
-            if mask_type == 2:
-                mask_2d[b, start:end, start:end] = True
-                position_ids[b, start:end] = torch.arange(0, end-start, dtype=torch.long, device=device)
-                input_start, input_end = start, end
-                next_position_id = end-start
-            if mask_type == 1:
-                mask_2d[b, start:end, input_start:input_end] = True
-                mask_2d[b, start:end, start:end] = causal_mask[0, :end-start, :end-start]
-                position_ids[b, start:end] = torch.arange(next_position_id, next_position_id+end-start, dtype=torch.long, device=device)
-                input_start, input_end = 0, 0
-                next_position_id = 0
-                
-            if mask_type == 0:
-                position_ids[b, start:end] = 0
-                input_start, input_end = 0, 0
-                next_position_id = 0
-    
-    return mask_2d, position_ids
-
 class GPT2Attention(nn.Module):
     def __init__(self, config, is_cross_attention=False, layer_idx=None):
         super().__init__()
@@ -728,6 +693,10 @@ class GPT2Model(GPT2PreTrainedModel):
         self.device_map = None
         self.gradient_checkpointing = False
 
+        # prefixlm
+        self.arange_tensor = torch.arange(0, config.max_length, dtype=torch.long)
+        self.causal_mask_base = torch.tril(torch.ones(1, config.max_length, config.max_length, dtype=torch.bool))
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -788,6 +757,43 @@ class GPT2Model(GPT2PreTrainedModel):
         for layer, heads in heads_to_prune.items():
             self.h[layer].attn.prune_heads(heads)
 
+    # created by dhlee347 for prefix LM
+    def prefix_lm_masking(self, attention_mask):
+        batch_size, seq_len = attention_mask.shape[0], attention_mask.shape[-1]
+        device = attention_mask.device
+
+        mask_2d = torch.zeros(batch_size, seq_len, seq_len, dtype=torch.bool, device=device)
+        causal_mask = self.causal_mask_base[:, :seq_len, :seq_len].clone().to(device)
+        position_ids = torch.zeros(batch_size, seq_len, dtype=torch.long, device=device)
+        
+        for b, mask_1d in enumerate(attention_mask):
+            input_start, input_end = 0, 0
+            next_position_id = 0
+            for group in itertools.groupby(enumerate(mask_1d.view(-1)), key=lambda x: x[1]):
+                mask_type = group[0]
+                indexes = [e[0] for e in group[1]]
+                start, end = indexes[0], indexes[-1] + 1
+                
+                if mask_type == 2:
+                    mask_2d[b, start:end, start:end] = True
+                    position_ids[b, start:end] = self.arange_tensor[:end-start]
+                    input_start, input_end = start, end
+                    next_position_id = end-start
+                
+                if mask_type == 1:
+                    mask_2d[b, start:end, input_start:input_end] = True
+                    mask_2d[b, start:end, start:end] = causal_mask[0, :end-start, :end-start]
+                    position_ids[b, start:end] = self.arange_tensor[next_position_id:next_position_id+end-start]
+                    input_start, input_end = 0, 0
+                    next_position_id = 0
+                    
+                if mask_type == 0:
+                    position_ids[b, start:end] = 0
+                    input_start, input_end = 0, 0
+                    next_position_id = 0
+        
+        return mask_2d, position_ids
+
     @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         checkpoint=_CHECKPOINT_FOR_DOC,
@@ -830,8 +836,18 @@ class GPT2Model(GPT2PreTrainedModel):
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
         device = input_ids.device if input_ids is not None else inputs_embeds.device
-
-        causal_mask, position_ids = prefix_lm_masking(attention_mask)
+        
+        if past_key_values:
+            batch_size, seq_len = attention_mask.shape[0], attention_mask.shape[-1]
+            tmp_causal_mask = list()
+            for _ in range(batch_size):
+                tmp_causal_mask.append(self.causal_mask_base[0, :seq_len, :seq_len].clone().to(device))
+            tmp_causal_mask = torch.stack(tmp_causal_mask, 0)
+            tmp_causal_mask[:, :self.causal_mask.shape[1], :self.causal_mask.shape[2]] = self.causal_mask
+            self.causal_mask = tmp_causal_mask
+        else:
+            self.causal_mask, position_ids = self.prefix_lm_masking(attention_mask)
+        
         if past_key_values:
             position_ids = position_ids[:, -1].unsqueeze(-1)
 
@@ -947,7 +963,7 @@ class GPT2Model(GPT2PreTrainedModel):
                     hidden_states,
                     layer_past=layer_past,
                     attention_mask=attention_mask,
-                    causal_mask=causal_mask,
+                    causal_mask=self.causal_mask,
                     head_mask=head_mask[i],
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
