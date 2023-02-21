@@ -844,6 +844,7 @@ class GPT2Model(GPT2PreTrainedModel):
                 tmp_causal_mask.append(self.causal_mask_base[0, :seq_len, :seq_len].clone().to(device))
             tmp_causal_mask = torch.stack(tmp_causal_mask, 0)
             tmp_causal_mask[:, :self.causal_mask.shape[1], :self.causal_mask.shape[2]] = self.causal_mask
+            tmp_causal_mask[:, -1, :-1] = tmp_causal_mask[:, -2, :-1]
             self.causal_mask = tmp_causal_mask
         else:
             self.causal_mask, position_ids = self.prefix_lm_masking(attention_mask)
